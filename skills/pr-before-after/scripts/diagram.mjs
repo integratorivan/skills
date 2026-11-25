@@ -1,35 +1,39 @@
 #!/usr/bin/env node
-// Render Mermaid diagrams into a polished "Before → After" PNG card for a PR, instead of relying on
+// Render diagrams into a polished "Before → After" PNG card for a PR, instead of relying on
 // GitHub/GitLab native Mermaid (their own theme, broken colors in dark mode, invisible in email,
 // Slack previews and mobile apps).
+//
+// The renderer is Pele (https://pele.run, MIT): Mermaid syntax, its own clean layout and look, every
+// Mermaid diagram type plus Pele's own (agentflow, swimlane, treeView, venn, wardley, …).
 //
 //   node diagram.mjs --before before.mmd --after after.mmd --out docs/pr/<slug>/03-deps.png --lang ru
 //   node diagram.mjs --md deps.md --out docs/pr/<slug>/03-deps.png      # two ```mermaid blocks (deps.mjs output)
 //   node diagram.mjs --src flow.mmd --out docs/pr/<slug>/04-flow.png     # one diagram, no diff
 //
-// The diff is computed from the diagrams themselves (flowcharts):
-//   - node id or edge (from → to) only in "before": removed (red, dashed, struck through);
-//   - only in "after": added (green);
-//   - same id with another label or another subgraph: changed (amber);
-//   - `class X added|removed|changed` in the source forces a status (e.g. a file whose code changed).
-// classDef / linkStyle / style lines are ignored: the renderer owns the look. Other diagram types
-// (sequence, state, …) are rendered with the same theme, without diff marks.
+// The diff is computed from the diagrams themselves:
+//   flowcharts — node id or edge (from → to) only in "before": removed (red, dashed, struck through);
+//     only in "after": added (green); same id with another label or another subgraph: changed (amber);
+//   other types (class, ER, state, mindmap, sequence participants, …) — the same by element id: a node
+//     only on one side is removed/added, a node whose text changed is changed; links are compared when
+//     their id names both ends (class, ER), not when it is just a position (state, sequence messages).
+//   `class X added|removed|changed` in a flowchart forces a status (e.g. a file whose code changed).
+// classDef / linkStyle / style lines are ignored: the renderer owns the look.
 //
 // Options:
 //   --layout auto|split|stack|unified  split = side by side, stack = one above the other,
-//                                      unified = one merged graph with the diff drawn on it.
+//                                      unified = one merged flowchart with the diff drawn on it.
 //                                      auto: split if it fits --max-width, else stack.
 //   --theme light|dark|both            both → <out>.png and <out>-dark.png for a <picture> tag
 //   --title "Зависимости: доска"       card title
 //   --lang ru|en                       panel names, legend, counters (use the PR language)
 //   --max-width 1680                   widest card before auto switches to stack
-//   --svg                              also save each panel as .svg next to the PNG
+//   --svg                              also save each panel as a self-contained .svg next to the PNG
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { CACHE_DIR, launchBrowser, parseArgs } from './lib.mjs';
 
-const MERMAID_VERSION = '11.17.2';
+const PELE_VERSION = '1.13.0';
 const args = parseArgs(process.argv.slice(2));
 const sources = readSources();
 if (!args.out || !sources.length) {
@@ -42,7 +46,7 @@ if (layout === 'unified' && sources.length !== 2) {
   process.exit(1);
 }
 const themes = args.theme === 'both' ? ['light', 'dark'] : [args.theme === 'dark' ? 'dark' : 'light'];
-const mermaidPath = await mermaidBundle();
+const pelePath = await peleBundle();
 
 const browser = await launchBrowser();
 try {
@@ -50,23 +54,32 @@ try {
     const page = await browser.newPage({ deviceScaleFactor: 2, viewport: { width: 2400, height: 1200 } });
     page.on('pageerror', (error) => console.error(error.message));
     await page.setContent('<!doctype html><meta charset="utf-8"><body></body>');
-    await page.addScriptTag({ path: mermaidPath });
-    const result = await page.evaluate(renderCard, {
-      sources,
-      layout,
-      theme,
-      lang: args.lang === 'en' ? 'en' : 'ru',
-      title: typeof args.title === 'string' ? args.title : '',
-      maxWidth: Number(args['max-width'] ?? 1680),
-    });
+    await page.addScriptTag({ path: pelePath });
+    let result;
+    try {
+      result = await page.evaluate(renderCard, {
+        sources,
+        layout,
+        theme,
+        lang: args.lang === 'en' ? 'en' : 'ru',
+        title: typeof args.title === 'string' ? args.title : '',
+        maxWidth: Number(args['max-width'] ?? 1680),
+      });
+    } catch (error) {
+      const message = String(error.message ?? error).replace(/^.*?Error:\s*/, '').split('\n').filter((line) => !/^\s+at /.test(line)).join('\n');
+      console.error(`Диаграмма не отрисовалась: ${message}`);
+      console.error('Проверь синтаксис в песочнице https://pele.run/playground');
+      process.exitCode = 1;
+      break;
+    }
     const out = theme === 'dark' && themes.length > 1 ? args.out.replace(/(\.png)?$/i, '-dark.png') : args.out;
     mkdirSync(dirname(resolve(out)), { recursive: true });
     await page.locator('#card').screenshot({ path: out, omitBackground: true });
     if (args.svg) result.svgs.forEach((svg, i) => writeFileSync(out.replace(/\.png$/i, `-${i + 1}.svg`), svg));
-    console.log(`${resolve(out)}  (${result.layout}, ${result.summary})`);
+    console.log(`${resolve(out)}  (${result.types.join(' → ')}, ${result.layout}, ${result.summary})`);
     await page.close();
   }
-  if (themes.length > 1) {
+  if (themes.length > 1 && !process.exitCode) {
     const light = args.out.replace(/^.*\//, '');
     console.log(
       `\nДля GitHub:\n<picture>\n  <source media="(prefers-color-scheme: dark)" srcset="<base>/${light.replace(/\.png$/i, '-dark.png')}?raw=true">\n` +
@@ -82,27 +95,27 @@ function readSources() {
   if (typeof args.before === 'string' && typeof args.after === 'string') return [read(args.before), read(args.after)];
   if (typeof args.src === 'string') return [read(args.src)];
   if (typeof args.md === 'string') {
-    const blocks = [...read(args.md).matchAll(/```mermaid\s*\n([\s\S]*?)```/g)].map((m) => m[1]);
+    const blocks = [...read(args.md).matchAll(/```(?:mermaid|pele)\s*\n([\s\S]*?)```/g)].map((m) => m[1]);
     if (blocks.length > 2) console.error(`В ${args.md} ${blocks.length} блоков mermaid, беру первые два.`);
     return blocks.slice(0, 2);
   }
   return [];
 }
 
-// Mermaid comes from the project if it has one, otherwise from the skill cache (downloaded once).
-async function mermaidBundle() {
+// Pele comes from the project if it has one, otherwise from the skill cache (downloaded once).
+async function peleBundle() {
   try {
-    const pkg = createRequire(join(process.cwd(), 'noop.js')).resolve('mermaid/package.json');
-    const file = join(dirname(pkg), 'dist', 'mermaid.min.js');
+    const pkg = createRequire(join(process.cwd(), 'noop.js')).resolve('pele/package.json');
+    const file = join(dirname(pkg), 'dist', 'pele.global.js');
     const major = Number(JSON.parse(readFileSync(pkg, 'utf8')).version.split('.')[0]);
-    if (major === 11 && existsSync(file)) return file;
+    if (major === 1 && existsSync(file)) return file;
   } catch {}
-  const cached = join(CACHE_DIR, `mermaid-${MERMAID_VERSION}.min.js`);
+  const cached = join(CACHE_DIR, `pele-${PELE_VERSION}.global.js`);
   if (existsSync(cached)) return cached;
-  const url = `https://cdn.jsdelivr.net/npm/mermaid@${MERMAID_VERSION}/dist/mermaid.min.js`;
+  const url = `https://cdn.jsdelivr.net/npm/pele@${PELE_VERSION}/dist/pele.global.js`;
   console.error(`Скачиваю ${url} в ${CACHE_DIR} (один раз)…`);
   const response = await fetch(url);
-  if (!response.ok) throw new Error(`Не удалось скачать Mermaid: HTTP ${response.status}`);
+  if (!response.ok) throw new Error(`Не удалось скачать Pele: HTTP ${response.status}`);
   mkdirSync(CACHE_DIR, { recursive: true });
   writeFileSync(cached, Buffer.from(await response.arrayBuffer()));
   return cached;
@@ -113,18 +126,20 @@ async function renderCard({ sources, layout, theme, lang, title, maxWidth }) {
   const T = {
     light: {
       page: '#ffffff', panel: '#f6f8fa', border: '#d1d9e0', text: '#1f2328', muted: '#59636e',
-      node: '#ffffff', nodeStroke: '#c8d1da', edge: '#8c959f', cluster: '#eef1f4', clusterStroke: '#d1d9e0',
+      node: '#ffffff', nodeStroke: '#c8d1da', edge: '#8c959f', cluster: '#eef1f4', clusterStroke: '#d1d9e0', accent: '#0969da',
       added: '#1a7f37', addedFill: '#dafbe1', addedText: '#0f5323',
       removed: '#cf222e', removedFill: '#ffebe9', removedText: '#82071e',
       changed: '#9a6700', changedFill: '#fff8c5', changedText: '#633c01',
+      series: ['#0969da', '#1a7f37', '#bf8700', '#cf222e', '#8250df', '#1b7c83', '#bc4c00', '#57606a'],
       shadow: 'rgba(31,35,40,.08)',
     },
     dark: {
       page: '#0d1117', panel: '#151b23', border: '#30363d', text: '#e6edf3', muted: '#9198a1',
-      node: '#0d1117', nodeStroke: '#3d444d', edge: '#656c76', cluster: '#1b222c', clusterStroke: '#30363d',
+      node: '#0d1117', nodeStroke: '#3d444d', edge: '#656c76', cluster: '#1b222c', clusterStroke: '#30363d', accent: '#4493f8',
       added: '#3fb950', addedFill: '#12261e', addedText: '#7ee787',
       removed: '#f85149', removedFill: '#2d1518', removedText: '#ffa198',
       changed: '#d29922', changedFill: '#272115', changedText: '#e3b341',
+      series: ['#4493f8', '#3fb950', '#d29922', '#f85149', '#ab7df8', '#39c5cf', '#db6d28', '#9198a1'],
       shadow: 'rgba(0,0,0,.4)',
     },
   }[theme];
@@ -143,49 +158,59 @@ async function renderCard({ sources, layout, theme, lang, title, maxWidth }) {
     },
   }[lang];
   const FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", "Helvetica Neue", Arial, sans-serif';
+  const MONO = 'ui-monospace, "SF Mono", "Fira Code", Menlo, Consolas, monospace';
   const STATUSES = ['added', 'removed', 'changed'];
+  const ns = 'http://www.w3.org/2000/svg';
 
-  mermaid.initialize({
-    startOnLoad: false,
-    securityLevel: 'strict',
-    theme: 'base',
-    fontFamily: FONT,
-    themeVariables: {
-      fontFamily: FONT, fontSize: '14px', background: T.panel,
-      primaryColor: T.node, primaryBorderColor: T.nodeStroke, primaryTextColor: T.text,
-      secondaryColor: T.cluster, tertiaryColor: T.cluster, lineColor: T.edge, textColor: T.text,
-      clusterBkg: T.cluster, clusterBorder: T.clusterStroke, titleColor: T.muted,
-      edgeLabelBackground: T.panel, noteBkgColor: T.changedFill, noteTextColor: T.text, noteBorderColor: T.changed,
-      actorBkg: T.node, actorBorder: T.nodeStroke, actorTextColor: T.text, signalColor: T.muted, signalTextColor: T.text,
-      labelBoxBkgColor: T.cluster, labelBoxBorderColor: T.nodeStroke, labelTextColor: T.text,
-      activationBkgColor: T.cluster, activationBorderColor: T.nodeStroke, sequenceNumberColor: T.page,
-    },
-    flowchart: { curve: 'basis', htmlLabels: true, nodeSpacing: 40, rankSpacing: 60, padding: 14, diagramPadding: 12 },
-    sequence: { useMaxWidth: false, mirrorActors: false, actorMargin: 60 },
-  });
+  const VARS = {
+    '--pele-bg': T.panel, '--pele-fg': T.text, '--pele-muted': T.muted, '--pele-line': T.edge,
+    '--pele-surface': T.node, '--pele-surface-alt': T.cluster, '--pele-border': T.nodeStroke, '--pele-accent': T.accent,
+    '--pele-font': FONT, '--pele-font-mono': MONO, '--pele-radius': '8px',
+    ...Object.fromEntries(T.series.map((c, i) => [`--pele-series-${i + 1}`, c])),
+  };
+  const shapes = ':is(rect, polygon, circle, ellipse, path):not(.pele-marker)';
+  // Diff marks. Kept apart from the card CSS so a saved .svg carries them too.
+  const SVG_CSS = `
+    .pele-node > ${shapes}:not(.badge *) { filter: drop-shadow(0 1px 1.5px ${T.shadow}); }
+    .pele-cluster > rect { stroke: ${T.clusterStroke}; }
+    .pele-cluster-label { font-weight: 600; font-size: 12.5px; }
+    ${STATUSES.map((s) => `
+    .pele-node[data-st=${s}] ${shapes}:not(.badge *) { fill: ${T[s + 'Fill']}; stroke: ${T[s]}; stroke-width: 2px; }
+    .pele-node[data-st=${s}] text:not(.badge *) { fill: ${T[s + 'Text']}; font-weight: 600; }
+    .pele-cluster[data-st=${s}] > rect { stroke: ${T[s]}; stroke-dasharray: 6 4; }
+    .pele-edge[data-st=${s}] path { stroke: ${T[s]}; }
+    .pele-edge[data-st=${s}] .pele-marker { fill: ${T[s]}; }
+    .pele-edge-label[data-st=${s}] text { fill: ${T[s]}; }
+    .badge-${s} rect { fill: ${T[s]}; }`).join('')}
+    .pele-edge[data-st=added] path:not(.pele-marker) { stroke-width: 2.6px; }
+    .pele-edge[data-st=removed] path:not(.pele-marker) { stroke-width: 2.2px; stroke-dasharray: 7 5; }
+    .pele-node[data-st=removed] ${shapes}:not(.badge *) { stroke-dasharray: 5 4; }
+    .pele-node[data-st=removed] text:not(.badge *) { text-decoration: line-through; text-decoration-thickness: 1.5px; }
+    .badge rect { stroke: none; filter: none; }
+    .badge text { fill: #fff; stroke: none; font: 700 10px/1 ${FONT}; dominant-baseline: middle; letter-spacing: .02em; text-decoration: none; }`;
 
   const clean = (src) => src.split('\n').filter((line) => !/^\s*(classDef|linkStyle|style)\s/.test(line)).join('\n');
 
-  async function model(src) {
-    const diagram = await mermaid.mermaidAPI.getDiagramFromText(clean(src));
-    if (!/^flowchart/.test(diagram.type)) return { flow: false, src: clean(src) };
-    const db = diagram.db;
-    const vertices = db.getVertices();
+  // Flowcharts get a full model (labels, subgraphs, forced classes); other types are diffed by element id.
+  function model(raw) {
+    const src = clean(raw);
+    const parsed = pele.parse(src);
+    if (parsed.type !== 'flowchart') return { flow: false, src, type: parsed.type };
     const nodes = new Map();
-    for (const [id, v] of vertices instanceof Map ? vertices : Object.entries(vertices)) {
+    for (const [id, v] of parsed.nodes instanceof Map ? parsed.nodes : Object.entries(parsed.nodes)) {
       nodes.set(id, { id, text: v.text ?? id, type: v.type, classes: v.classes ?? [] });
     }
-    const subgraphs = db.getSubGraphs();
+    const subgraphs = parsed.subgraphs ?? [];
     const parent = new Map();
     for (const sg of subgraphs) for (const child of sg.nodes) parent.set(child, sg.id);
-    const edges = db.getEdges().map((e) => ({ id: e.id, start: e.start, end: e.end, key: `${e.start}\u0000${e.end}`, text: e.text ?? '', stroke: e.stroke, type: e.type }));
-    return { flow: true, src: clean(src), nodes, edges, subgraphs, parent, direction: db.getDirection?.() ?? 'LR' };
+    const edges = parsed.edges.map((e) => ({ id: e.id, start: e.start, end: e.end, key: `${e.start}\u0000${e.end}`, text: e.text ?? '' }));
+    return { flow: true, src, type: parsed.type, nodes, edges, subgraphs, parent, direction: parsed.direction ?? 'LR' };
   }
 
   const forced = (node) => STATUSES.find((s) => node.classes.includes(s));
-  const differs = (a, b, other) => a.text !== b.text || (a.parent ?? '') !== (b.parent ?? '');
+  const differs = (a, b) => a.text !== b.text || (a.parent ?? '') !== (b.parent ?? '');
 
-  // status maps for one panel: side = 'before' | 'after' | 'unified'
+  // Flowchart status maps for one panel: side = 'before' | 'after'
   function statuses(m, other, side) {
     const node = new Map();
     const edge = new Map();
@@ -201,6 +226,23 @@ async function renderCard({ sources, layout, theme, lang, title, maxWidth }) {
     const otherClusters = new Set(other?.subgraphs.map((s) => s.id) ?? []);
     for (const sg of m.subgraphs) cluster.set(sg.id, !other || otherClusters.has(sg.id) ? 'same' : gone);
     return { node, edge, cluster };
+  }
+
+  // Any other type: what each rendered element is, by its data-id.
+  const positional = (id) => /^(edge|i|e|L)?\d+$/.test(id);
+  function inventory(svg) {
+    const text = (el) => [...el.querySelectorAll('text')].map((t) => t.textContent.trim()).filter(Boolean).join(' | ');
+    const node = new Map();
+    for (const g of svg.querySelectorAll('.pele-node[data-id]')) if (!node.has(g.dataset.id)) node.set(g.dataset.id, text(g));
+    const edge = new Map();
+    for (const g of svg.querySelectorAll('.pele-edge[data-id]')) if (!positional(g.dataset.id)) edge.set(g.dataset.id, '');
+    return { node, edge };
+  }
+  function domStatuses(mine, other, side) {
+    const gone = side === 'before' ? 'removed' : 'added';
+    const node = new Map([...mine.node].map(([id, t]) => [id, !other.node.has(id) ? gone : other.node.get(id) !== t ? 'changed' : 'same']));
+    const edge = new Map([...mine.edge.keys()].map((id) => [id, other.edge.has(id) ? 'same' : gone]));
+    return { node, edge, cluster: new Map() };
   }
 
   // One merged flowchart: union of both sides, statuses taken from where each element exists.
@@ -235,7 +277,7 @@ async function renderCard({ sources, layout, theme, lang, title, maxWidth }) {
     const emit = (id, indent) => {
       if (sgs.has(id)) {
         const sg = sgs.get(id);
-        lines.push(`${indent}subgraph ${id}["${String(sg.title).replace(/"/g, '#quot;')}"]`);
+        lines.push(`${indent}subgraph ${id}["${String(sg.title ?? id).replace(/"/g, '#quot;')}"]`);
         for (const [child, p] of parent) if (p === id) emit(child, indent + '  ');
         lines.push(`${indent}end`);
       } else if (nodes.has(id)) {
@@ -243,42 +285,45 @@ async function renderCard({ sources, layout, theme, lang, title, maxWidth }) {
       }
     };
     for (const id of [...sgs.keys(), ...nodes.keys()]) if (!parent.has(id)) emit(id, '  ');
-    edges.forEach((e, i) => lines.push(`  ${e.start} e${i}@-->${e.text ? `|"${e.text.replace(/"/g, '#quot;')}"|` : ''} ${e.end}`));
+    for (const e of edges) lines.push(`  ${e.start} -->${e.text ? `|"${e.text.replace(/"/g, '#quot;')}"|` : ''} ${e.end}`);
     const src = lines.join('\n');
+    // Edge ids come from the renderer; match them back by their ends.
+    const byKey = new Map(edges.map((e) => [e.key, e.st]));
+    const edge = new Map(pele.parse(src).edges.map((e) => [e.id, byKey.get(`${e.start}\u0000${e.end}`) ?? 'same']));
     const cluster = new Map([...sgs.keys()].map((id) => [id, !after.subgraphs.some((s) => s.id === id) ? 'removed' : !before.subgraphs.some((s) => s.id === id) ? 'added' : 'same']));
-    return { src, st: { node, edge: new Map(edges.map((e, i) => [`e${i}`, e.st])), cluster } };
+    return { src, st: { node, edge, cluster } };
   }
 
   let renderSeq = 0;
-  async function draw(src, st) {
-    const rid = `d${++renderSeq}`;
-    const { svg } = await mermaid.render(rid, src);
+  function draw(src) {
+    const { svg } = pele.render(src, { fontFamily: FONT, fontFamilyMono: MONO, fontSize: 14, idPrefix: `d${++renderSeq}-`, autoDirection: false });
     const holder = document.createElement('div');
     holder.className = 'canvas';
     holder.innerHTML = svg;
     const el = holder.querySelector('svg');
-    el.removeAttribute('style');
     el.style.maxWidth = 'none';
+    for (const [k, v] of Object.entries(VARS)) el.style.setProperty(k, v);
     document.getElementById('stage').append(holder);
-    if (st) decorate(el, rid, st);
-    // Keep Mermaid's own viewBox (sequence lifelines are drawn longer and cropped by it), plus room for badges.
-    const [x, y, width, height] = (el.getAttribute('viewBox') ?? '').split(/[\s,]+/).map(Number);
-    const box = Number.isFinite(height) && width > 0 ? { x, y, width, height } : el.getBBox();
-    const pad = 16;
-    el.setAttribute('viewBox', `${box.x - pad} ${box.y - pad} ${box.width + pad * 2} ${box.height + pad * 2}`);
-    el.setAttribute('width', box.width + pad * 2);
-    el.setAttribute('height', box.height + pad * 2);
     return holder;
   }
 
-  function decorate(svg, rid, st) {
-    const ns = 'http://www.w3.org/2000/svg';
-    for (const g of svg.querySelectorAll('g.node')) {
-      const id = g.id.match(new RegExp(`^${rid}-flowchart-(.+)-\\d+$`))?.[1];
-      const status = st.node.get(id) ?? 'same';
+  // Room for badges that stick out over the top-right corner of a node.
+  function pad(el) {
+    const [x, y, width, height] = (el.getAttribute('viewBox') ?? '').split(/[\s,]+/).map(Number);
+    const box = Number.isFinite(height) && width > 0 ? { x, y, width, height } : el.getBBox();
+    const p = 16;
+    el.setAttribute('viewBox', `${box.x - p} ${box.y - p} ${box.width + p * 2} ${box.height + p * 2}`);
+    el.setAttribute('width', box.width + p * 2);
+    el.setAttribute('height', box.height + p * 2);
+  }
+
+  function decorate(svg, st) {
+    for (const g of svg.querySelectorAll('.pele-node[data-id]')) {
+      const status = st.node.get(g.dataset.id) ?? 'same';
       g.dataset.st = status;
-      g.querySelectorAll('rect.label-container, .basic.label-container').forEach((r) => r.tagName === 'rect' && (r.setAttribute('rx', 8), r.setAttribute('ry', 8)));
-      if (status === 'same') continue;
+      if (status === 'same' || g.querySelector(':scope > .badge')) continue;
+      // Sequence diagrams draw each participant twice; badge only the top one.
+      if ([...svg.querySelectorAll(`.pele-node[data-id="${CSS.escape(g.dataset.id)}"]`)][0] !== g) continue;
       const box = g.getBBox();
       const badge = document.createElementNS(ns, 'g');
       badge.setAttribute('class', `badge badge-${status}`);
@@ -286,8 +331,7 @@ async function renderCard({ sources, layout, theme, lang, title, maxWidth }) {
       text.textContent = L.badge[status];
       badge.append(text);
       g.append(badge);
-      const tw = text.getComputedTextLength();
-      const w = tw + 14;
+      const w = text.getComputedTextLength() + 14;
       const h = 17;
       const x = box.x + box.width - w + 8;
       const y = box.y - h / 2 - 1;
@@ -297,37 +341,8 @@ async function renderCard({ sources, layout, theme, lang, title, maxWidth }) {
       text.setAttribute('y', y + h / 2 + 0.5);
       badge.prepend(pill);
     }
-    for (const g of svg.querySelectorAll('g.cluster')) {
-      const id = g.id.slice(rid.length + 1);
-      g.dataset.st = st.cluster.get(id) ?? 'same';
-    }
-    const markers = {};
-    const defs = svg.querySelector('defs') ?? svg.insertBefore(document.createElementNS(ns, 'defs'), svg.firstChild);
-    const markerFor = (status, end) => {
-      const key = `${status}-${end}`;
-      if (markers[key]) return markers[key];
-      const base = svg.querySelector(`marker[id$="flowchart-v2-point${end}"]`);
-      if (!base) return null;
-      const clone = base.cloneNode(true);
-      clone.id = `${rid}-arrow-${key}`;
-      clone.querySelectorAll('path').forEach((p) => p.setAttribute('style', `fill: var(--edge-${status}); stroke: none;`));
-      defs.append(clone);
-      return (markers[key] = clone.id);
-    };
-    for (const path of svg.querySelectorAll('.edgePaths path[data-id], path.flowchart-link')) {
-      const status = st.edge.get(path.dataset.id ?? path.id.slice(rid.length + 1)) ?? 'same';
-      path.dataset.st = status;
-      path.removeAttribute('style');
-      for (const [attr, end] of [['marker-end', 'End'], ['marker-start', 'Start']]) {
-        if ((path.getAttribute(attr) ?? '').includes('point')) {
-          const id = markerFor(status, end);
-          if (id) path.setAttribute(attr, `url(#${id})`);
-        }
-      }
-    }
-    for (const label of svg.querySelectorAll('.edgeLabel .label[data-id]')) {
-      label.closest('.edgeLabel').dataset.st = st.edge.get(label.dataset.id) ?? 'same';
-    }
+    for (const g of svg.querySelectorAll('.pele-cluster[data-id]')) g.dataset.st = st.cluster.get(g.dataset.id) ?? 'same';
+    for (const g of svg.querySelectorAll('.pele-edge[data-id], .pele-edge-label[data-id]')) g.dataset.st = st.edge.get(g.dataset.id) ?? 'same';
   }
 
   const plural = (n, forms) => {
@@ -349,8 +364,7 @@ async function renderCard({ sources, layout, theme, lang, title, maxWidth }) {
     html, body { margin: 0; background: transparent; }
     body { padding: 0; font-family: ${FONT}; -webkit-font-smoothing: antialiased; }
     #card { display: inline-flex; flex-direction: column; gap: 18px; padding: 24px; background: ${T.page};
-      border: 1px solid ${T.border}; border-radius: 18px; color: ${T.text}; box-sizing: border-box;
-      --edge-same: ${T.edge}; --edge-added: ${T.added}; --edge-removed: ${T.removed}; --edge-changed: ${T.changed}; }
+      border: 1px solid ${T.border}; border-radius: 18px; color: ${T.text}; box-sizing: border-box; }
     header { display: flex; align-items: center; justify-content: space-between; gap: 32px; min-height: 22px; }
     header .title { font-size: 17px; font-weight: 650; letter-spacing: -.01em; }
     .legend { display: flex; gap: 16px; font-size: 12.5px; color: ${T.muted}; flex-wrap: wrap; }
@@ -370,61 +384,51 @@ async function renderCard({ sources, layout, theme, lang, title, maxWidth }) {
     .stat .added { color: ${T.added}; } .stat .removed { color: ${T.removed}; } .stat .changed { color: ${T.changed}; }
     .canvas { display: flex; justify-content: center; align-items: center; flex: 1; }
     .arrow { align-self: center; color: ${T.muted}; font-size: 22px; padding: 0 2px; }
-    svg { overflow: hidden; }
-    svg rect.actor { rx: 8px; ry: 8px; fill: ${T.node} !important; stroke: ${T.nodeStroke} !important; filter: drop-shadow(0 1px 1.5px ${T.shadow}); }
-    svg .actor-line { stroke: ${T.border} !important; }
-    svg foreignObject { overflow: visible; }
-    svg .nodeLabel, svg .edgeLabel, svg .cluster-label { font-family: ${FONT} !important; }
-    svg .nodeLabel p, svg .edgeLabel p { margin: 0; }
-    svg .node :is(rect, polygon, circle, ellipse, path).label-container,
-    svg .node > :is(rect, polygon, circle, ellipse, path) { fill: ${T.node} !important; stroke: ${T.nodeStroke} !important; stroke-width: 1.3px !important; filter: drop-shadow(0 1px 1.5px ${T.shadow}); }
-    svg .node .nodeLabel { color: ${T.text} !important; }
-    ${['added', 'removed', 'changed'].map((s) => `
-    svg .node[data-st=${s}] :is(rect, polygon, circle, ellipse, path).label-container,
-    svg .node[data-st=${s}] > :is(rect, polygon, circle, ellipse, path) { fill: ${T[s + 'Fill']} !important; stroke: ${T[s]} !important; stroke-width: 2px !important; }
-    svg .node[data-st=${s}] .nodeLabel { color: ${T[s + 'Text']} !important; font-weight: 600; }
-    svg .badge-${s} rect { fill: ${T[s]} !important; stroke: none !important; filter: none !important; }
-    svg .cluster[data-st=${s}] rect { stroke: ${T[s]} !important; stroke-dasharray: 6 4; }`).join('')}
-    svg .node[data-st=removed] :is(rect, polygon, circle, ellipse, path).label-container,
-    svg .node[data-st=removed] > :is(rect, polygon, circle, ellipse, path) { stroke-dasharray: 5 4; }
-    svg .node[data-st=removed] .nodeLabel { text-decoration: line-through; text-decoration-thickness: 1.5px; }
-    svg .badge text { fill: #fff !important; stroke: none !important; font: 700 10px/1 ${FONT} !important; dominant-baseline: middle; letter-spacing: .02em; }
-    svg .cluster rect { fill: ${T.cluster} !important; stroke: ${T.clusterStroke} !important; stroke-width: 1px !important; rx: 12px; ry: 12px; }
-    svg .cluster-label .nodeLabel, svg .cluster-label span { color: ${T.muted} !important; font-weight: 600; font-size: 12.5px; }
-    svg .edgePaths path { stroke: ${T.edge} !important; stroke-width: 1.6px !important; fill: none !important; }
-    svg .edgePaths path.edge-pattern-dotted { stroke-dasharray: 3 4; }
-    svg .edgePaths path[data-st=added] { stroke: ${T.added} !important; stroke-width: 2.6px !important; }
-    svg .edgePaths path[data-st=removed] { stroke: ${T.removed} !important; stroke-width: 2.2px !important; stroke-dasharray: 7 5 !important; }
-    svg .edgeLabel, svg .edgeLabel p, svg .labelBkg { background: ${T.panel} !important; color: ${T.muted} !important; font-size: 12.5px; }
-    svg .edgeLabel[data-st=added] p { color: ${T.added} !important; } svg .edgeLabel[data-st=removed] p { color: ${T.removed} !important; }
-    svg .marker { fill: ${T.edge} !important; stroke: none !important; }
+    svg.pele { overflow: hidden; }
+    ${SVG_CSS.replace(/^(\s*)\./gm, '$1svg.pele .')}
   </style>`);
   document.body.innerHTML = '<div id="card"><header><div class="title"></div><div class="legend"></div></header><div id="stage" class="panels"></div></div>';
   document.querySelector('header .title').textContent = title;
 
-  const models = await Promise.all(sources.map(model));
+  const models = sources.map(model);
   const flow = models.every((m) => m.flow);
   const panels = [];
   const used = new Set();
   const track = (st) => st && [...st.node.values(), ...st.edge.values(), ...st.cluster.values()].forEach((s) => used.add(s));
+  const finish = (holder, st) => {
+    const svg = holder.querySelector('svg');
+    if (st) decorate(svg, st);
+    pad(svg);
+    return holder;
+  };
 
   if (layout === 'unified') {
     if (!flow) throw new Error('--layout unified работает только для flowchart');
     const { src, st } = unify(models[0], models[1]);
     track(st);
-    panels.push({ cls: 'unified', name: L.unified, holder: await draw(src, st), stats: [...count(st, 'added', '+').map((t) => ['added', t]), ...count(st, 'removed', '−').map((t) => ['removed', t]), ...changedCount(st).map((t) => ['changed', t])] });
+    panels.push({ cls: 'unified', name: L.unified, holder: finish(draw(src), st), stats: [...count(st, 'added', '+').map((t) => ['added', t]), ...changedCount(st).map((t) => ['changed', t]), ...count(st, 'removed', '−').map((t) => ['removed', t])] });
   } else if (models.length === 2) {
     const [b, a] = models;
-    const stB = flow ? statuses(b, a, 'before') : null;
-    const stA = flow ? statuses(a, b, 'after') : null;
+    const [hb, ha] = [draw(b.src), draw(a.src)];
+    // Diff only like with like: a flowchart turned into a sequence diagram is two pictures, not a diff.
+    const comparable = b.type === a.type;
+    let stB = null, stA = null;
+    if (flow) {
+      stB = statuses(b, a, 'before');
+      stA = statuses(a, b, 'after');
+    } else if (comparable) {
+      const [ib, ia] = [inventory(hb.querySelector('svg')), inventory(ha.querySelector('svg'))];
+      stB = domStatuses(ib, ia, 'before');
+      stA = domStatuses(ia, ib, 'after');
+    }
     track(stB); track(stA);
-    panels.push({ cls: 'before', name: L.before, holder: await draw(b.src, stB), stats: stB ? [...count(stB, 'removed', '−').map((t) => ['removed', t]), ...changedCount(stB).map((t) => ['changed', t])] : [] });
-    panels.push({ cls: 'after', name: L.after, holder: await draw(a.src, stA), stats: stA ? [...count(stA, 'added', '+').map((t) => ['added', t]), ...changedCount(stA).map((t) => ['changed', t])] : [] });
+    panels.push({ cls: 'before', name: L.before, holder: finish(hb, stB), stats: stB ? [...count(stB, 'removed', '−').map((t) => ['removed', t]), ...changedCount(stB).map((t) => ['changed', t])] : [], diffed: !!stB });
+    panels.push({ cls: 'after', name: L.after, holder: finish(ha, stA), stats: stA ? [...count(stA, 'added', '+').map((t) => ['added', t]), ...changedCount(stA).map((t) => ['changed', t])] : [], diffed: !!stA });
   } else {
     const m = models[0];
     const st = m.flow ? statuses(m, null, 'after') : null;
     track(st);
-    panels.push({ cls: 'single', name: '', holder: await draw(m.src, st), stats: [] });
+    panels.push({ cls: 'single', name: '', holder: finish(draw(m.src), st), stats: [] });
   }
 
   const stage = document.getElementById('stage');
@@ -441,7 +445,7 @@ async function renderCard({ sources, layout, theme, lang, title, maxWidth }) {
       head.innerHTML = `<span class="tag ${p.cls}"></span><span class="stat"></span>`;
       head.querySelector('.tag').textContent = p.name;
       const stat = head.querySelector('.stat');
-      for (const [cls, text] of p.stats.length || !flow ? p.stats : [['', L.none]]) {
+      for (const [cls, text] of p.stats.length || !p.diffed ? p.stats : [['', L.none]]) {
         const span = document.createElement('span');
         span.className = cls;
         span.textContent = text;
@@ -461,7 +465,7 @@ async function renderCard({ sources, layout, theme, lang, title, maxWidth }) {
 
   const legend = document.querySelector('.legend');
   const sample = { added: T.added, removed: T.removed, changed: T.changed };
-  for (const s of ['added', 'removed', 'changed']) {
+  for (const s of STATUSES) {
     if (!used.has(s)) continue;
     const item = document.createElement('span');
     item.innerHTML = s === 'changed' ? `<b style="border-color:${T.changed};background:${T.changedFill}"></b>` : `<i style="border-color:${sample[s]};${s === 'removed' ? 'border-top-style:dashed;' : ''}"></i>`;
@@ -470,7 +474,14 @@ async function renderCard({ sources, layout, theme, lang, title, maxWidth }) {
   }
   if (!title && !legend.children.length) document.querySelector('header').remove();
 
-  const svgs = panels.map((p) => p.holder.querySelector('svg').outerHTML);
+  const svgs = panels.map((p) => {
+    const svg = p.holder.querySelector('svg').cloneNode(true);
+    const style = document.createElementNS(ns, 'style');
+    style.textContent = SVG_CSS;
+    svg.prepend(style);
+    svg.style.background = T.panel;
+    return svg.outerHTML;
+  });
   const summary = panels.map((p) => `${p.name || 'diagram'}: ${p.stats.map((s) => s[1]).join(', ') || '—'}`).join(' | ');
-  return { layout: mode, svgs, summary };
+  return { layout: mode, svgs, summary, types: models.map((m) => m.type) };
 }

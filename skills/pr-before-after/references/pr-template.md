@@ -52,7 +52,7 @@
   <img alt="Зависимости: было → стало. <одна фраза о главном изменении>" src="docs/pr/<slug>/05-deps.png">
 </picture>
 
-<details><summary>Исходник диаграммы (Mermaid)</summary>
+<details><summary>Исходник диаграммы (Mermaid, рендер pele)</summary>
 
 ```mermaid
 flowchart LR
@@ -93,7 +93,7 @@ flowchart LR
 
 ## Диаграммы
 
-- В PR кладётся PNG из `diagram.mjs`, а исходник Mermaid уходит в свёрнутый `<details>`: так
+- В PR кладётся PNG из `diagram.mjs` (pele), а исходник в синтаксисе Mermaid уходит в свёрнутый `<details>`: так
   ревьюер видит одинаковую картинку везде, а исходник можно поправить в следующем коммите.
 - `<picture>` с тёмной версией работает на GitHub. GitLab `<picture>` не понимает, там оставляй
   только `<img>` светлой версии: карточка непрозрачная и читается в любой теме.

@@ -8,7 +8,7 @@
 
 | Скилл | Что делает |
 | --- | --- |
-| [`pr-before-after`](skills/pr-before-after/SKILL.md) | Оформляет pull/merge request с визуальными доказательствами: скриншоты «Было → Стало» с метками, автоматическая обводка изменений, чёткие GIF сценариев, диаграммы зависимостей в собственном рендере вместо нативного Mermaid, публикация медиа со ссылками по SHA. |
+| [`pr-before-after`](skills/pr-before-after/SKILL.md) | Оформляет pull/merge request с визуальными доказательствами: скриншоты «Было → Стало» с метками, автоматическая обводка изменений, чёткие GIF сценариев, диаграммы «было / стало» любого типа (flowchart, sequence, классы, ER, состояния и др.) через [pele](https://pele.run) вместо нативного Mermaid, публикация медиа со ссылками по SHA. |
 
 ## Установка
 
@@ -67,7 +67,7 @@ done
 | ffmpeg | GIF, MP4, сжатие PNG | `brew install ffmpeg` |
 | `gh` / `glab` | создание и обновление PR/MR | `brew install gh glab`, затем `gh auth login` / `glab auth login` |
 
-Mermaid для диаграмм скачивается один раз в `~/.cache/pr-before-after` при первом запуске `diagram.mjs`.
+Рендерер диаграмм [pele](https://pele.run) (синтаксис Mermaid) берётся из проекта, если он там есть, иначе скачивается один раз в `~/.cache/pr-before-after` при первом запуске `diagram.mjs`.
 
 ## Как добавить скилл в репозиторий
 
